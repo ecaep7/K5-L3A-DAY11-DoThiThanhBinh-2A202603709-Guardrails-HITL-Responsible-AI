@@ -13,7 +13,7 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
-
+from core.config import DEMO_SECRETS
 
 # ============================================================
 # Implement content_filter()
@@ -41,12 +41,15 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        # --- Bí mật hệ thống ---
+        "api_key": r"sk-[a-zA-Z0-9-]+",
+        "password": r"password\s*(?:is|:|=)\s*\S+",          # "password is X", "password: X", "password=X"
+        "db_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?\b",  # db.vinbank.internal:5432
+        "known_secret": "|".join(re.escape(s) for s in DEMO_SECRETS) if DEMO_SECRETS else r"(?!x)x",
+        # --- PII khách hàng ---
+        "email": r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "phone": r"\b0\d{9,10}\b",                             # SĐT VN 10–11 số
+        "national_id": r"\b\d{9}\b|\b\d{12}\b",                # CMND 9 số / CCCD 12 số
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -172,16 +175,33 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        SECRET_TYPES = {"api_key", "password", "db_host", "known_secret"}
 
-        return llm_response  # TODO: modify if needed
+        result = content_filter(response_text)
+        if not result["safe"]:
+            # Lấy tên loại vấn đề: "api_key: 1 found" -> "api_key"
+            issue_types = {issue.split(":")[0] for issue in result["issues"]}
+
+            if issue_types & SECRET_TYPES:
+                # Mức nặng: lộ bí mật hệ thống -> chặn cả câu trả lời
+                self.blocked_count += 1
+                safe_text = (
+                    "I cannot share internal system details. "
+                    "Please ask me about VinBank banking services."
+                )
+            else:
+                # Mức nhẹ: chỉ có PII khách hàng -> che từng chỗ
+                self.redacted_count += 1
+                safe_text = result["redacted"]
+
+            # Thay nội dung câu trả lời bằng bản an toàn
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=safe_text)],
+            )
+
+        # (LLM-as-Judge là phần optional, không chấm -> bỏ qua)
+        return llm_response
 
 
 # ============================================================

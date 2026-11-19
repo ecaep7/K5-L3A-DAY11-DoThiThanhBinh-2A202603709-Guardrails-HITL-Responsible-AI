@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,23 +43,41 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# Ký tự vô hình hay bị dùng để "giấu" câu lệnh tấn công
+_ZERO_WIDTH = re.compile(r"[\u200b-\u200f\u2060\ufeff\u00ad]")
+
+
+def _normalize(text: str) -> str:
+    """Làm sạch chuỗi trước khi so khớp (giống TRIM + LOWER trong SQL)."""
+    text = unicodedata.normalize("NFKC", text or "")      # gom các ký tự "nhìn giống nhau" về một dạng
+    text = _ZERO_WIDTH.sub("", text)                       # xóa ký tự vô hình
+    text = unicodedata.normalize("NFD", text)              # tách chữ và dấu tiếng Việt
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")  # bỏ dấu: "bỏ qua" -> "bo qua"
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = re.sub(r"\s+", " ", text)                       # nhiều dấu cách -> 1 dấu cách
+    return text.lower().strip()
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
-
-    Args:
-        user_input: The user's message
 
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
     INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+        r"ignore (all )?((the|your|previous|above|prior) )*(instructions|rules)",
+        r"(forget|disregard) (all )?((the|your|previous|above|prior) )*(instructions|rules)",
+        r"you are now",
+        r"system prompt",
+        r"reveal (your |the )?(instructions|prompt)",
+        r"pretend (you are|to be)",
+        r"act as (a |an )?unrestricted",
+        r"bo qua (moi |tat ca )?(cac )?(huong dan|chi dan|quy tac)",  # "bỏ qua mọi hướng dẫn"
     ]
 
+    text = _normalize(user_input)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, text):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,15 +103,17 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    text = _normalize(user_input)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    def _has_any(keywords: list[str]) -> bool:
+        # \b = từ khóa phải đứng ở ĐẦU một từ -> "kill" không khớp nhầm "skill"
+        return any(re.search(r"\b" + re.escape(k), text) for k in keywords)
 
-    pass  # Replace with your implementation
-
+    if _has_any(BLOCKED_TOPICS):
+        return "BLOCK"
+    if not _has_any(ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 # ============================================================
 # Implement InputGuardrailPlugin
@@ -144,14 +165,23 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # Lớp 1: phát hiện prompt injection
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I cannot process that request. "
+                "I can only help with VinBank banking questions."
+            )
 
-        pass  # Replace with your implementation
+        # Lớp 2: chỉ cho câu hỏi về ngân hàng
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I'm a VinBank assistant and can only help with banking-related questions."
+            )
+
+        # Qua cả 2 lớp -> cho đi tiếp tới model
+        return None
 
 
 # ============================================================
